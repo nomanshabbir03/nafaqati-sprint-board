@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Nafaqati Sprint Board</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/styles.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.js"></script>
+</head>
+<body>
+<div class="wrap" id="app">
+  <header class="top">
+    <div>
+      <h1 id="h-title">Sprint Board</h1>
+      <p class="sub" id="h-sub"></p>
+    </div>
+    <div class="progress" id="progress" aria-live="polite"></div>
+  </header>
+  <div id="banner"></div>
+  <nav class="days" id="days" aria-label="Work days"></nav>
+  <div class="bar-tools">
+    <div class="seg" role="group" aria-label="View">
+      <button id="v-board" aria-pressed="true">Board</button>
+      <button id="v-gantt" aria-pressed="false">Gantt</button>
+      <button id="v-table" aria-pressed="false">Table</button>
+    </div>
+    <input class="search" id="q" type="search" placeholder="Filter by title or person" aria-label="Filter cards">
+    <div class="chips" id="areas" role="group" aria-label="Filter by area"></div>
+    <span class="spacer"></span>
+    <span class="live" id="live">Connecting</span>
+  </div>
+  <main id="main"></main>
+</div>
+<div id="layer"></div>
+
+<script>
+const AREAS = {
+  data:  { label: 'Data reading', c: 'var(--a1)' },
+  model: { label: 'Model prediction', c: 'var(--a2)' },
+  sync:  { label: 'Sync & backend', c: 'var(--a3)' },
+  dash:  { label: 'Dashboard', c: 'var(--a4)' },
+  qa:    { label: 'QA & release', c: 'var(--a5)' }
+};
+const STATUS = [
+  { id: 'backlog', label: 'Backlog', c: 'var(--s-backlog)', p: 0 },
+  { id: 'todo', label: 'To do', c: 'var(--s-todo)', p: 0 },
+  { id: 'doing', label: 'In progress', c: 'var(--s-doing)', p: 0.5 },
+  { id: 'review', label: 'In review', c: 'var(--s-review)', p: 0.85 },
+  { id: 'done', label: 'Done', c: 'var(--s-done)', p: 1 }
+];
+const PRI = { high: { label: 'High', c: 'var(--bad)' }, med: { label: 'Medium', c: 'var(--s-doing)' }, low: { label: 'Low', c: 'var(--s-backlog)' } };
+const WD = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+let settings = { title: 'Sprint Board', subtitle: '', rangeStart: '', rangeEnd: '', offDays: [0] };
+let DAYS = [];
+let tasks = [], loaded = false, failed = false;
+let editKey = '', canWrite = false, openMode = false;
+let view = 'board', fDay = '', fArea = '', fText = '';
+let dragId = null, dropAt = null, dialog = null, pendingRender = false;
+
+try { editKey = localStorage.getItem('nb-key') || ''; const v = localStorage.getItem('nb-view'); if (v === 'table' || v === 'gantt') view = v; } catch (e) {}
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const initials = (n) => String(n || '').trim().split(/\s+/).slice(0, 2).map((w) => w[0] || '').join('').toUpperCase();
+const byOrder = (a, b) => (a.position ?? 0) - (b.position ?? 0);
+const stat = (id) => STATUS.find((s) => s.id === id);
+const iso = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+const parseIso = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+const dayIx = (id) => (id ? DAYS.findIndex((d) => d.id === id) : -1);
+const dayLabel = (id) => { const d = DAYS[dayIx(id)]; return d ? d.name + ' ' + d.date : ''; };
+
+function buildDays() {
+  DAYS = [];
+  if (!settings.rangeStart || !settings.rangeEnd) return;
+  const end = parseIso(settings.rangeEnd);
+  for (let d = parseIso(settings.rangeStart), n = 0; d <= end && n < 120; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1), n++) {
+    DAYS.push({ id: iso(d), name: WD[d.getDay()], date: d.getDate(), off: settings.offDays.includes(d.getDay()), final: iso(d) === settings.rangeEnd });
+  }
+}
+
+/* data layer */
+async function api(method, url, body) {
+  const r = await fetch(url, {
+    method,
+    headers: Object.assign({ 'content-type': 'application/json' }, editKey ? { 'x-edit-key': editKey } : {}),
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  if (!r.ok) {
+    let msg = 'Request failed.';
+    try { msg = (await r.json()).error || msg; } catch (e) {}
+    throw Object.assign(new Error(msg), { status: r.status });
+  }
+  return r.status === 204 ? null : r.json();
+}
+async function load() {
+  try {
+    const b = await api('GET', '/api/board');
+    settings = b.settings; tasks = b.tasks; buildDays();
+    loaded = true; failed = false;
+  } catch (e) { failed = true; }
+  render();
+}
+async function checkEditor() {
+  try { const m = await api('GET', '/api/me'); canWrite = !!m.canEdit; openMode = !!m.open; } catch (e) { canWrite = false; }
+  if (editKey && !canWrite) { editKey = ''; try { localStorage.removeItem('nb-key'); } catch (e) {} }
+}
+let loadTimer = 0;
+function scheduleLoad() { clearTimeout(loadTimer); loadTimer = setTimeout(load, 120); }
+let live = false, liveMode = 'polling';
+// Supabase Realtime pings us when a card or the settings change; we then refetch the board.
+// If Realtime is unavailable, the board refreshes every few seconds instead.
+async function connect() {
+  let realtime = false;
+  try {
+    const c = await api('GET', '/api/config');
+    if (c.supabaseUrl && c.supabaseAnonKey && window.supabase) {
+      const sb = window.supabase.createClient(c.supabaseUrl, c.supabaseAnonKey);
+      sb.channel('board')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, scheduleLoad)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'board_settings' }, scheduleLoad)
+        .subscribe((s) => { live = s === 'SUBSCRIBED'; if (live) scheduleLoad(); render(); });
+      realtime = true; liveMode = 'realtime';
+    }
+  } catch (e) {}
+  if (!realtime) live = true;
+  setInterval(() => { if (!document.hidden && !dialog) load(); }, realtime ? 30000 : 5000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleLoad(); });
+}
+
+function visible(ignoreDay) {
+  const q = fText.trim().toLowerCase();
+  return tasks.filter((t) =>
+    (ignoreDay || !fDay || (t.start && t.start <= fDay && fDay <= (t.end || t.start))) && (!fArea || t.area === fArea) &&
+    (!q || (t.title || '').toLowerCase().includes(q) || (t.assignee || '').toLowerCase().includes(q)));
+}
+
+function toast(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast'; el.setAttribute('role', 'status'); el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3400);
+}
+
+function renderHeader() {
+  document.title = settings.title;
+  $('h-title').textContent = settings.title;
+  const f = (s) => parseIso(s).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  $('h-sub').textContent = (settings.rangeStart ? f(settings.rangeStart) + ' – ' + f(settings.rangeEnd) : '') + (settings.subtitle ? ' · ' + settings.subtitle : '');
+
+  const total = tasks.length;
+  const n = (s) => tasks.filter((t) => t.status === s).length;
+  const done = n('done'), review = n('review'), doing = n('doing'), todo = n('todo'), backlog = n('backlog');
+  const w = (x) => (total ? x / total * 100 : 0);
+  $('progress').innerHTML =
+    '<div class="row"><span><b>' + Math.round(w(done)) + '%</b> complete</span><span><b>' + done + '</b> of <b>' + total + '</b> cards done</span></div>' +
+    '<div class="bar" role="img" aria-label="' + done + ' of ' + total + ' done"><i style="background:var(--s-done);width:' + w(done) + '%"></i><i style="background:var(--s-review);width:' + w(review) + '%"></i><i style="background:var(--s-doing);width:' + w(doing) + '%"></i><i style="background:var(--s-todo);width:' + w(todo) + '%"></i></div>' +
+    '<div class="legend"><span style="--c:var(--s-done)">Done ' + done + '</span><span style="--c:var(--s-review)">Review ' + review + '</span><span style="--c:var(--s-doing)">In progress ' + doing + '</span><span style="--c:var(--s-todo)">To do ' + todo + '</span><span style="--c:var(--s-backlog)">Backlog ' + backlog + '</span></div>';
+
+  $('banner').innerHTML = canWrite && openMode
+    ? '<div class="banner"><span>Anyone with this link can edit. Changes save for everyone straight away.</span><span class="spacer"></span><button class="btn small" id="b-settings">Board settings</button></div>'
+    : canWrite
+    ? '<div class="banner"><span>Editing is on. Changes save for everyone straight away.</span><span class="spacer"></span><button class="btn small" id="b-settings">Board settings</button><button class="btn small" id="b-lock">Lock editing</button></div>'
+    : '<div class="banner"><span>You are viewing this board. The team can unlock editing with the edit key.</span><span class="spacer"></span><button class="btn small" id="b-unlock">Unlock editing</button></div>';
+
+  const today = iso(new Date());
+  $('days').className = 'days' + (DAYS.length > 10 ? ' scroll' : '');
+  $('days').innerHTML = DAYS.map((d) => {
+    if (d.off) return '<div class="day off"><span class="d">' + d.name + ' ' + d.date + '</span><span class="n">Off</span></div>';
+    const list = tasks.filter((t) => t.start && t.start <= d.id && d.id <= (t.end || t.start));
+    const dn = list.filter((t) => t.status === 'done').length;
+    const cls = 'day' + (d.id === today ? ' today' : '') + (d.final ? ' final' : '');
+    return '<button class="' + cls + '" data-day="' + d.id + '" aria-pressed="' + (fDay === d.id) + '"><span class="d">' + d.name + ' ' + d.date + '</span><span class="n">' + dn + ' / ' + list.length + ' done</span><span class="m"><i style="width:' + (list.length ? dn / list.length * 100 : 0) + '%"></i></span></button>';
+  }).join('');
+
+  $('areas').innerHTML = Object.keys(AREAS).map((k) =>
+    '<button class="chip" style="--c:' + AREAS[k].c + '" data-area="' + k + '" aria-pressed="' + (fArea === k) + '">' + AREAS[k].label + '</button>').join('');
+
+  ['board', 'gantt', 'table'].forEach((v) => $('v-' + v).setAttribute('aria-pressed', view === v));
+  const el = $('live');
+  el.className = 'live' + (live ? '' : ' ro');
+  el.textContent = failed ? 'Cannot reach the server' : !loaded ? 'Connecting' : live ? (liveMode === 'realtime' ? 'Live · updates appear automatically' : 'Updates every few seconds') : 'Reconnecting';
+}
+
+function cardHtml(t) {
+  const a = AREAS[t.area], p = PRI[t.priority];
+  return '<button class="card" data-id="' + t.id + '"' + (canWrite ? ' draggable="true"' : '') + '>' +
+    '<span class="t">' + esc(t.title) + '</span>' +
+    '<span class="meta">' +
+      '<span class="num">#' + t.id + '</span>' +
+      (a ? '<span class="tag" style="--c:' + a.c + '">' + a.label + '</span>' : '') +
+      (p ? '<span class="pri ' + t.priority + '" style="--pc:' + p.c + '">' + p.label + '</span>' : '') +
+      (dayIx(t.start) >= 0 ? '<span>' + dayLabel(t.start) + (t.end && t.end !== t.start && dayIx(t.end) >= 0 ? ' → ' + dayLabel(t.end) : '') + '</span>' : '') +
+      (t.assignee ? '<span class="who"><span class="av">' + esc(initials(t.assignee)) + '</span></span>' : '') +
+    '</span></button>';
+}
+
+/* gantt */
+function ganttHtml() {
+  const list = visible(true);
+  const today = iso(new Date());
+  const n = DAYS.length;
+  const cells = () => DAYS.map((d, i) => '<div class="gc' + (d.off ? ' off' : '') + (d.id === today ? ' today' : '') + '" style="grid-column:' + (i + 2) + '"></div>').join('');
+  let h = '<div class="gwrap"><div class="gantt" style="--n:' + n + ';min-width:' + (290 + n * 84) + 'px">';
+  h += '<div class="grow ghead"><div class="gl">Task</div>' + DAYS.map((d) => '<div class="gh' + (d.off ? ' off' : '') + (d.id === today ? ' today' : '') + '">' + d.name + '<b>' + d.date + '</b>' + (d.off ? 'Off' : d.id === today ? 'Today' : d.final ? 'Final' : '&nbsp;') + '</div>').join('') + '</div>';
+  const scheduled = (t) => dayIx(t.start) >= 0;
+  const keys = Object.keys(AREAS).filter((k) => list.some((t) => t.area === k && scheduled(t)));
+  keys.forEach((k) => {
+    const A = AREAS[k];
+    const items = list.filter((t) => t.area === k && scheduled(t)).sort((a, b) => dayIx(a.start) - dayIx(b.start) || byOrder(a, b));
+    const dn = items.filter((t) => t.status === 'done').length;
+    h += '<div class="grow ggroup"><div class="gl" style="color:' + A.c + '">' + A.label + '</div><div class="gg" style="--c:' + A.c + '"><span class="gprog"><i style="width:' + (items.length ? dn / items.length * 100 : 0) + '%"></i></span><span>' + dn + ' of ' + items.length + ' done</span></div></div>';
+    items.forEach((t) => {
+      const s = stat(t.status) || STATUS[1];
+      const a = dayIx(t.start);
+      let b = t.end ? dayIx(t.end) : a;
+      if (b < a) b = a;
+      const dot = s.id === 'done' ? ' done' : (s.id === 'doing' || s.id === 'review') ? ' half' : '';
+      h += '<div class="grow">' +
+        '<button class="gl" data-id="' + t.id + '" title="' + esc(t.title) + ' · ' + s.label + '"><span class="sdot' + dot + '" style="--sc:' + s.c + '"></span><span class="num" style="color:var(--muted)">#' + t.id + '</span><span class="tt">' + esc(t.title) + '</span></button>' +
+        cells() +
+        '<button class="gbar ' + s.id + '" data-id="' + t.id + '" style="--c:' + A.c + ';--p:' + (s.p * 100) + '%;grid-column:' + (a + 2) + ' / ' + (b + 3) + '" aria-label="' + esc(t.title) + ', ' + s.label + '"><i></i>' + (s.id === 'done' ? '<span>✓</span>' : '') + '</button></div>';
+    });
+  });
+  if (!keys.length) h += '<div class="gnote">No scheduled cards match the current filters.</div>';
+  const un = list.filter((t) => !scheduled(t));
+  if (un.length) h += '<div class="gnote"><b>Unscheduled or outside the date range</b>' + un.map((t) => '<button data-id="' + t.id + '">#' + t.id + ' ' + esc(t.title) + '</button>').join('') + '</div>';
+  h += '</div></div>';
+  h += '<div class="gleg"><span>Bar fill shows progress:</span><span><span class="k" style="--p:0%"></span>To do</span><span><span class="k" style="--p:50%"></span>In progress</span><span><span class="k" style="--p:85%"></span>In review</span><span><span class="k" style="--p:100%"></span>Done</span>' + (canWrite ? '<span>Click a bar to edit its status, start or end day.</span>' : '') + '</div>';
+  return h;
+}
+
+function renderMain() {
+  const main = $('main');
+  if (!loaded) { main.innerHTML = '<div class="empty"><b>' + (failed ? 'Cannot reach the board server' : 'Loading the board') + '</b>' + (failed ? 'Check that the server is running, then reload.' : 'Fetching the latest cards.') + '</div>'; return; }
+  const addBtn = canWrite ? '<p class="hint"><button class="btn" data-add="todo">New card</button></p>' : '';
+  if (!tasks.length) {
+    main.innerHTML = '<div class="empty"><b>No cards yet</b>' + (canWrite ? 'Add the first card to start the plan.' : 'The team has not added cards yet.') + '</div>' + addBtn;
+    return;
+  }
+  if (view === 'gantt') { main.innerHTML = ganttHtml() + addBtn; return; }
+  const list = visible();
+  if (view === 'table') {
+    const order = Object.fromEntries(STATUS.map((s, i) => [s.id, i]));
+    const ix = (t) => (dayIx(t.start) < 0 ? 999 : dayIx(t.start));
+    const rows = list.slice().sort((a, b) => ix(a) - ix(b) || order[a.status] - order[b.status] || byOrder(a, b));
+    main.innerHTML = '<div class="tablewrap"><table><thead><tr><th>#</th><th>Title</th><th>Area</th><th>Status</th><th>Priority</th><th>Schedule</th><th>Owner</th></tr></thead><tbody>' +
+      rows.map((t) => {
+        const a = AREAS[t.area], s = stat(t.status), p = PRI[t.priority];
+        return '<tr tabindex="0" data-id="' + t.id + '"><td class="num">' + t.id + '</td><td>' + esc(t.title) + '</td>' +
+          '<td>' + (a ? '<span class="tag" style="--c:' + a.c + '">' + a.label + '</span>' : '') + '</td>' +
+          '<td>' + (s ? '<span class="pill" style="--sc:' + s.c + '">' + s.label + '</span>' : '') + '</td>' +
+          '<td>' + (p ? '<span class="pri ' + t.priority + '" style="--pc:' + p.c + '">' + p.label + '</span>' : '') + '</td>' +
+          '<td>' + (dayIx(t.start) >= 0 ? dayLabel(t.start) + (t.end && t.end !== t.start && dayIx(t.end) >= 0 ? ' → ' + dayLabel(t.end) : '') : 'Unscheduled') + '</td><td>' + esc(t.assignee) + '</td></tr>';
+      }).join('') + '</tbody></table></div>' + addBtn;
+    return;
+  }
+  main.innerHTML = '<div class="board">' + STATUS.map((s) => {
+    const items = list.filter((t) => t.status === s.id).sort(byOrder);
+    return '<section class="column" data-s="' + s.id + '"><div class="col-head"><span class="pill" style="--sc:' + s.c + '">' + s.label + '</span><span class="count">' + items.length + '</span></div>' +
+      '<div class="cards" data-s="' + s.id + '">' + items.map(cardHtml).join('') + '</div>' +
+      (canWrite ? '<button class="add" data-add="' + s.id + '">+ Add card</button>' : '') + '</section>';
+  }).join('') + '</div>';
+}
+
+function render() {
+  if (dragId) { pendingRender = true; return; }
+  if (dialog && dialog.kind === 'card') { renderHeader(); return; }
+  renderHeader();
+  renderMain();
+}
+
+/* dialogs */
+const opts = (arr, sel, blank) => (blank ? '<option value="">' + blank + '</option>' : '') +
+  arr.map((o) => '<option value="' + o[0] + '"' + (o[0] === sel ? ' selected' : '') + '>' + o[1] + '</option>').join('');
+
+function openCard(id, status) {
+  const t = id ? tasks.find((x) => String(x.id) === String(id)) : null;
+  if (id && !t) return;
+  dialog = { kind: 'card', id: t ? t.id : null };
+  const v = t || { title: '', notes: '', status: status || 'todo', area: 'data', priority: 'med', start: '', end: '', assignee: '' };
+  const dis = canWrite ? '' : ' disabled';
+  const dayOpts = DAYS.filter((d) => !d.off).map((d) => [d.id, d.name + ' ' + d.date]);
+  $('layer').innerHTML = '<div class="scrim" id="scrim"><form class="dlg" id="dlg" role="dialog" aria-modal="true" aria-labelledby="dtitle">' +
+    '<h3 id="dtitle">' + (t ? 'Card #' + t.id : 'New card') + '</h3>' +
+    '<div class="field"><label for="f-title">Title</label><input id="f-title" required maxlength="160" value="' + esc(v.title) + '"' + dis + '></div>' +
+    '<div class="field"><label for="f-notes">Notes</label><textarea id="f-notes" maxlength="2000"' + dis + '>' + esc(v.notes) + '</textarea></div>' +
+    '<div class="grid2">' +
+      '<div class="field"><label for="f-status">Status</label><select id="f-status"' + dis + '>' + opts(STATUS.map((s) => [s.id, s.label]), v.status) + '</select></div>' +
+      '<div class="field"><label for="f-area">Area</label><select id="f-area"' + dis + '>' + opts(Object.keys(AREAS).map((k) => [k, AREAS[k].label]), v.area) + '</select></div>' +
+      '<div class="field"><label for="f-day">Starts</label><select id="f-day"' + dis + '>' + opts(dayOpts, v.start, 'Unscheduled') + '</select></div>' +
+      '<div class="field"><label for="f-end">Ends</label><select id="f-end"' + dis + '>' + opts(dayOpts, v.end, 'Same day') + '</select></div>' +
+      '<div class="field"><label for="f-pri">Priority</label><select id="f-pri"' + dis + '>' + opts(Object.keys(PRI).map((k) => [k, PRI[k].label]), v.priority) + '</select></div>' +
+      '<div class="field"><label for="f-who">Owner</label><input id="f-who" maxlength="60" value="' + esc(v.assignee) + '" placeholder="Name"' + dis + '></div>' +
+    '</div><div class="err" id="d-err" role="alert"></div>' +
+    '<div class="actions">' +
+      (canWrite ? '<button class="btn primary" type="submit" id="d-save">' + (t ? 'Save' : 'Create card') + '</button>' : '') +
+      '<button class="btn" type="button" id="d-close">' + (canWrite ? 'Cancel' : 'Close') + '</button>' +
+      '<span class="spacer"></span>' +
+      (t && canWrite ? '<button class="btn danger" type="button" id="d-del">Delete card</button>' : '') +
+    '</div></form></div>';
+  $('f-title').focus();
+}
+function openSettings() {
+  dialog = { kind: 'settings' };
+  const offs = WD.map((n, i) => '<label><input type="checkbox" name="off" value="' + i + '"' + (settings.offDays.includes(i) ? ' checked' : '') + '>' + n + '</label>').join('');
+  $('layer').innerHTML = '<div class="scrim" id="scrim"><form class="dlg" id="dlg" role="dialog" aria-modal="true" aria-labelledby="dtitle">' +
+    '<h3 id="dtitle">Board settings</h3>' +
+    '<div class="field"><label for="s-title">Board title</label><input id="s-title" required maxlength="80" value="' + esc(settings.title) + '"></div>' +
+    '<div class="field"><label for="s-sub">Subtitle</label><input id="s-sub" maxlength="200" value="' + esc(settings.subtitle) + '"></div>' +
+    '<div class="grid2"><div class="field"><label for="s-start">First day</label><input id="s-start" type="date" required value="' + esc(settings.rangeStart) + '"></div>' +
+    '<div class="field"><label for="s-end">Final day</label><input id="s-end" type="date" required value="' + esc(settings.rangeEnd) + '"></div></div>' +
+    '<div class="field"><label>Days off</label><div class="checks">' + offs + '</div></div>' +
+    '<div class="err" id="d-err" role="alert"></div>' +
+    '<div class="actions"><button class="btn primary" type="submit" id="d-save">Save settings</button><button class="btn" type="button" id="d-close">Cancel</button></div></form></div>';
+  $('s-title').focus();
+}
+function openUnlock() {
+  dialog = { kind: 'unlock' };
+  $('layer').innerHTML = '<div class="scrim" id="scrim"><form class="dlg" id="dlg" role="dialog" aria-modal="true" aria-labelledby="dtitle">' +
+    '<h3 id="dtitle">Unlock editing</h3>' +
+    '<div class="field"><label for="u-key">Edit key</label><input id="u-key" type="password" autocomplete="off" required></div>' +
+    '<div class="err" id="d-err" role="alert"></div>' +
+    '<div class="actions"><button class="btn primary" type="submit" id="d-save">Unlock</button><button class="btn" type="button" id="d-close">Cancel</button></div></form></div>';
+  $('u-key').focus();
+}
+function closeDialog() { dialog = null; $('layer').innerHTML = ''; render(); }
+const showErr = (m) => { const e = $('d-err'); if (e) e.textContent = m; };
+
+async function submitDialog() {
+  const btn = $('d-save'); btn.disabled = true; showErr('');
+  try {
+    if (dialog.kind === 'unlock') {
+      editKey = $('u-key').value.trim();
+      await checkEditor();
+      if (!canWrite) { showErr('That key is not right.'); btn.disabled = false; return; }
+      try { localStorage.setItem('nb-key', editKey); } catch (e) {}
+      closeDialog(); toast('Editing unlocked.'); return;
+    }
+    if (dialog.kind === 'settings') {
+      const off = [...document.querySelectorAll('input[name=off]:checked')].map((c) => Number(c.value));
+      await api('PUT', '/api/settings', { title: $('s-title').value, subtitle: $('s-sub').value, rangeStart: $('s-start').value, rangeEnd: $('s-end').value, offDays: off });
+      closeDialog(); await load(); return;
+    }
+    const body = {
+      title: $('f-title').value.trim(), notes: $('f-notes').value.trim(), status: $('f-status').value, area: $('f-area').value,
+      priority: $('f-pri').value, start: $('f-day').value || null, end: $('f-end').value || null, assignee: $('f-who').value.trim()
+    };
+    if (!body.title) { showErr('Give the card a title.'); btn.disabled = false; return; }
+    if (dialog.id) await api('PATCH', '/api/tasks/' + dialog.id, body);
+    else await api('POST', '/api/tasks', body);
+    closeDialog(); await load();
+  } catch (e) {
+    btn.disabled = false;
+    if (e.status === 401) { canWrite = false; editKey = ''; closeDialog(); toast('Your edit key stopped working. Unlock editing again.'); }
+    else showErr(e.message);
+  }
+}
+async function deleteCard() {
+  try { await api('DELETE', '/api/tasks/' + dialog.id); closeDialog(); await load(); }
+  catch (e) { showErr(e.message); }
+}
+
+/* drag and drop (board view) */
+function dropIndex(list, y, ignoreId) {
+  const cards = [...list.querySelectorAll('.card')].filter((c) => c.dataset.id !== ignoreId);
+  for (let i = 0; i < cards.length; i++) {
+    const r = cards[i].getBoundingClientRect();
+    if (y < r.top + r.height / 2) return { i, ids: cards.map((c) => c.dataset.id) };
+  }
+  return { i: cards.length, ids: cards.map((c) => c.dataset.id) };
+}
+function clearLine() { document.querySelectorAll('.drop-line').forEach((n) => n.remove()); document.querySelectorAll('.column.over').forEach((n) => n.classList.remove('over')); }
+
+document.addEventListener('dragstart', (e) => {
+  const c = e.target.closest && e.target.closest('.card');
+  if (!c || !canWrite) return;
+  dragId = c.dataset.id; c.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', dragId); } catch (x) {}
+});
+document.addEventListener('dragover', (e) => {
+  if (!dragId) return;
+  const list = e.target.closest && e.target.closest('.cards');
+  if (!list) return;
+  e.preventDefault();
+  clearLine();
+  list.closest('.column').classList.add('over');
+  const { i } = dropIndex(list, e.clientY, dragId);
+  const line = document.createElement('div'); line.className = 'drop-line';
+  const cards = [...list.querySelectorAll('.card')].filter((c) => c.dataset.id !== dragId);
+  list.insertBefore(line, cards[i] || null);
+  dropAt = { status: list.dataset.s, i, ids: cards.map((c) => c.dataset.id) };
+});
+document.addEventListener('dragend', () => {
+  dragId = null; clearLine();
+  document.querySelectorAll('.card.dragging').forEach((c) => c.classList.remove('dragging'));
+  if (pendingRender) { pendingRender = false; render(); }
+});
+document.addEventListener('drop', async (e) => {
+  if (!dragId || !dropAt) return;
+  e.preventDefault();
+  const id = dragId, at = dropAt; dropAt = null;
+  const byId = Object.fromEntries(tasks.map((t) => [String(t.id), t]));
+  const prev = at.i > 0 ? byId[at.ids[at.i - 1]] : null;
+  const next = at.i < at.ids.length ? byId[at.ids[at.i]] : null;
+  let position;
+  if (prev && next) position = ((prev.position ?? 0) + (next.position ?? 0)) / 2;
+  else if (prev) position = (prev.position ?? 0) + 1000;
+  else if (next) position = (next.position ?? 0) - 1000;
+  else position = 1000;
+  const cur = byId[id];
+  if (cur && (cur.status !== at.status || cur.position !== position)) {
+    cur.status = at.status; cur.position = position;
+    try { await api('PATCH', '/api/tasks/' + id, { status: at.status, position }); }
+    catch (err) { toast(err.message); await load(); }
+  }
+});
+
+/* clicks */
+function setView(v) { view = v; try { localStorage.setItem('nb-view', v); } catch (x) {} render(); }
+document.addEventListener('click', (e) => {
+  const t = e.target;
+  if (dialog) {
+    if (t.closest('#d-close') || t.id === 'scrim') return closeDialog();
+    if (t.closest('#d-del')) {
+      const b = t.closest('#d-del');
+      if (!b.dataset.sure) { b.dataset.sure = '1'; b.textContent = 'Click again to delete'; return; }
+      return deleteCard();
+    }
+    return;
+  }
+  const day = t.closest('[data-day]'); if (day) { fDay = fDay === day.dataset.day ? '' : day.dataset.day; return render(); }
+  const area = t.closest('[data-area]'); if (area) { fArea = fArea === area.dataset.area ? '' : area.dataset.area; return render(); }
+  if (t.closest('#v-board')) return setView('board');
+  if (t.closest('#v-gantt')) return setView('gantt');
+  if (t.closest('#v-table')) return setView('table');
+  if (t.closest('#b-unlock')) return openUnlock();
+  if (t.closest('#b-settings')) return openSettings();
+  if (t.closest('#b-lock')) { editKey = ''; canWrite = false; try { localStorage.removeItem('nb-key'); } catch (x) {} return render(); }
+  const add = t.closest('[data-add]'); if (add) return openCard(null, add.dataset.add);
+  const card = t.closest('.card, tbody tr, .gbar, button.gl, .gnote button'); if (card && card.dataset.id) return openCard(card.dataset.id);
+});
+document.addEventListener('submit', (e) => { e.preventDefault(); if (dialog) submitDialog(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && dialog) closeDialog();
+  if (e.key === 'Enter' && e.target.matches && e.target.matches('tbody tr')) openCard(e.target.dataset.id);
+});
+$('q').addEventListener('input', (e) => { fText = e.target.value; render(); });
+
+/* start */
+render();
+(async () => { await checkEditor(); await load(); connect(); })();
+</script>
+</body>
+</html>

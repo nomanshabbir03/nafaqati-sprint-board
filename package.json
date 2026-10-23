@@ -1,0 +1,17 @@
+{
+  "name": "nafaqati-board",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Sprint board on Vercel and Supabase",
+  "scripts": {
+    "dev": "node --env-file=.env.local dev.js",
+    "test": "node test/api.test.js",
+    "export-seed": "node scripts/export-seed.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.117.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
