@@ -53,6 +53,7 @@ Module._load = function (request, ...rest) {
 process.env.SUPABASE_URL = 'http://fake';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'fake';
 process.env.EDIT_KEY = 'secret-key';
+process.env.OPEN_EDITING = 'false';
 process.env.SUPABASE_ANON_KEY = 'anon';
 
 const board = require('../api/board');
@@ -115,7 +116,7 @@ function call(handler, method, { body, query, key } = {}) {
 
   delete process.env.EDIT_KEY;
   assert.equal((await call(tasks, 'POST', { key: 'anything', body: { title: 'x' } })).status, 503, 'no EDIT_KEY configured means no editing');
-  process.env.OPEN_EDITING = 'true';
+  delete process.env.OPEN_EDITING;
   r = await call(tasks, 'POST', { body: { title: 'Open card' } });
   assert.equal(r.status, 201, 'open editing needs no key');
   assert.equal((await call(me, 'GET')).body.open, true);
